@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Plex server stack
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: c5.large
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-050981837962d44ac
+  Subnets:
+    Description: Choose which subnets the Application Load Balancer should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  S3Bucket:
+    Type: String
+  S3MoviesPrefix:
+    Type: String
+    Default: movies/
+  S3ConfigurationsPrefix:
+    Type: String
+    Default: config/
+
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Plex server instance security group
+      GroupName: !Sub ${AWS::StackName}Instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 32400
+          ToPort: 32400
+          SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Plex server load balancer security group
+      GroupName: !Sub ${AWS::StackName}LoadBalancer
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}Instance
+      Description: !Sub ${AWS::StackName}Instance
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}Instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}/${S3MoviesPrefix}*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}/${S3ConfigurationsPrefix}*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}Instance
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchConfig:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        ImageId: !Ref ImageId
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt InstanceSecurityGroup.GroupId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+            sudo su
+            echo "Starting plex install"
+            export DEBIAN_FRONTEND=noninteractive
+            echo deb https://downloads.plex.tv/repo/deb public main | tee /etc/apt/sources.list.d/plexmediaserver.list
+            curl https://downloads.plex.tv/plex-keys/PlexSign.key | apt-key add -
+            apt update
+            apt -o DPkg::Options::="--force-confnew" -y install plexmediaserver awscli xmlstarlet
+
+            mkdir /var/lib/plexmediaserver/Library/Movies/
+            chown plex:plex /var/lib/plexmediaserver/Library/Movies/
+            aws s3 sync s3://${S3Bucket}/${S3MoviesPrefix} /var/lib/plexmediaserver/Library/Movies/
+
+            cat > ~/backup_plex_config.sh <<- EOM
+            #!/bin/bash
+            set -x
+
+            cd "/var/lib/plexmediaserver/Library/Application Support/"
+            rm /tmp/plex.tar.gz
+            tar czfv /tmp/plex.tar.gz --exclude "Plex Media Server/Cache/*" --exclude "Plex Media Server/Logs/*" "Plex Media Server/"
+            aws s3 cp /tmp/plex.tar.gz s3://${S3Bucket}/${S3ConfigurationsPrefix}plex.tar.gz
+            EOM
+            chmod +x ~/backup_plex_config.sh
+
+            cat > ~/load_plex_config.sh <<- EOM
+            #!/bin/bash
+            set -x
+
+            aws s3 cp s3://${S3Bucket}/${S3ConfigurationsPrefix}plex.tar.gz /tmp/
+            cd "/var/lib/plexmediaserver/Library/Application Support/"
+            rm -rf "Plex Media Server"
+            tar xzf /tmp/plex.tar.gz
+            cd "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server"
+            cp Preferences.xml Preferences.xml.bak
+            xmlstarlet ed -L -u /Preferences/@customConnections -v "http://${LoadBalancer.DNSName}" Preferences.xml
+            EOM
+            chmod +x ~/load_plex_config.sh
+
+            sh ~/load_plex_config.sh
+            service plexmediaserver restart
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}
+      AvailabilityZones: !GetAZs
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchConfig
+        Version: !GetAtt LaunchConfig.LatestVersionNumber
+      MaxSize: 10
+      MinSize: 0
+      TargetGroupARNs:
+        - !Ref LoadBalancerTargetGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 32400
+      Protocol: HTTP
+      LoadBalancerArn: !Ref LoadBalancer
+      DefaultActions:
+        - TargetGroupArn: !Ref LoadBalancerTargetGroup
+          Type: forward
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      HealthCheckPath: /web/index.html
+      Port: 32400
+      Protocol: HTTP
+      VpcId: !Ref VpcId
